@@ -27,9 +27,11 @@ use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 use windows_sys::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessId};
 use windows_sys::Win32::UI::WindowsAndMessaging::{MESSAGEBOX_STYLE, MessageBoxW};
+use debug::{register_exception_handler, write_minidump};
 
 mod hooks;
 mod utils;
+mod debug;
 
 static BP_MODS: OnceCell<PathBuf> = OnceCell::new();
 static UE4SS_MODS: OnceCell<PathBuf> = OnceCell::new();
@@ -76,6 +78,9 @@ unsafe fn shim_init() {
     std::panic::set_hook(Box::new(|x| unsafe {
         let message = format!("unreal-shimloader has crashed: \n\n{x}");
         error!("{message}");
+        
+        // Try to capture a minidump for panics
+        write_minidump(std::ptr::null_mut());
 
         let message = U16CString::from_str(message);
         MessageBoxW(
@@ -85,6 +90,9 @@ unsafe fn shim_init() {
             0
         );
     }));
+
+    // Handle explicit exceptions 
+    register_exception_handler();
 
     let current_exe = env::current_exe()
         .expect("Failed to get the path of the currently running executable.");
