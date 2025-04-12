@@ -22,18 +22,21 @@ use windows_sys::Win32::Foundation::{
     HANDLE, 
     MAX_PATH, 
     NTSTATUS, 
-    UNICODE_STRING
+    UNICODE_STRING,
+    HMODULE
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FindClose, FindFileHandle, FindFirstFileExW, FindFirstFileW, FindNextFileW, GetFileAttributesExW, GetFileAttributesW, NtCreateFile, FILE_ATTRIBUTE_DIRECTORY, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, GET_FILEEX_INFO_LEVELS, NT_CREATE_FILE_DISPOSITION, WIN32_FIND_DATAW
 };
+use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, AddDllDirectory};
 use windows_sys::Win32::System::WindowsProgramming::{
     IO_STATUS_BLOCK,
     IO_STATUS_BLOCK_0,
     OBJECT_ATTRIBUTES
 };
 use crate::utils::{self, NormalizedPath};
+
 
 static_detour! {
     pub static CreateFileW_Detour: unsafe extern "system" fn(
@@ -88,7 +91,12 @@ static_detour! {
     ) -> BOOL;
 
     pub static FindClose_Detour: unsafe extern "system" fn(HANDLE) -> BOOL;
+
+    pub static LoadLibraryW_Detour: unsafe extern "system" fn(PCWSTR) -> HMODULE;
+
+    pub static AddDllDirectory_Detour: unsafe extern "system" fn(PCWSTR) -> *mut c_void;
 }
+
 
 pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
     CreateFileW_Detour.initialize(CreateFileW, |a, b, c, d, e, f, g| unsafe {
@@ -134,6 +142,15 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
     FindFirstFileExW_Detour.initialize(FindFirstFileExW, |a, b, c, d, e, f| unsafe {
         findfirstfileexw_detour(a, b, c, d, e, f)
     })?.enable()?;
+
+    LoadLibraryW_Detour.initialize(LoadLibraryW, |lpfilename| unsafe {
+        loadlibraryw_detour(lpfilename)
+    })?.enable()?;
+
+    AddDllDirectory_Detour.initialize(AddDllDirectory, |lppathnamestr| unsafe {
+        adddlldirectory_detour(lppathnamestr) 
+    })?.enable()?;
+    
 
     Ok(())
 }
@@ -188,13 +205,41 @@ pub unsafe extern "system" fn ntcreatefile_detour(
     let og_prefix = slice::from_raw_parts(unicode_path.Buffer, 4);
     let offset_path = unicode_path.Buffer.add(4);
 
-    let original_path_str = U16CStr::from_ptr(offset_path, path_len - 4)
-        .expect("Failed to create U16CStr from raw unicode buffer.");
-
+    // Create a raw slice and handle potential nulls safely
+    let slice = slice::from_raw_parts(offset_path, path_len - 4);
+    
+    // Find the first null terminator, if any
+    let null_pos = slice.iter().position(|&c| c == 0);
+    
+    let effective_len = null_pos.unwrap_or(path_len - 4);
+    let effective_slice = &slice[..effective_len];
+    
+    // Use from_vec instead of from_slice
+    let wide_string = WideString::from_vec(effective_slice.to_vec());
+    let original_path_result = wide_string.to_string();
+    
+    // Early return if we can't process the path
+    if original_path_result.is_err() {
+        return NtCreateFile_Detour.call(
+            file_handle,
+            desired_access,
+            object_attrs,
+            io_status_block,
+            allocation_size,
+            file_attrs,
+            share_access,
+            creation_disposition,
+            create_options,
+            ea_buffer,
+            ea_length
+        );
+    }
+    
+    let original_path_str = original_path_result.unwrap();
+    
     let bad_path_prefixes = ["\\\\device", "c:\\windows"];
     if bad_path_prefixes.iter().any(|x| {
-        let lowercase = original_path_str.to_string().unwrap().to_lowercase();
-
+        let lowercase = original_path_str.to_lowercase();
         lowercase.starts_with(&x.to_lowercase())
     }) {
         return NtCreateFile_Detour.call(
@@ -212,10 +257,10 @@ pub unsafe extern "system" fn ntcreatefile_detour(
         );
     };
 
-    let original_path = PathBuf::from(original_path_str.to_string().unwrap());
+    let original_path = PathBuf::from(original_path_str);
     let new_path = NormalizedPath::new(&original_path);
     let new_path = utils::reroot_path(&new_path).unwrap_or(new_path.0);
-
+    
     debug!("[ntcreatefile_detour] {:?} to {:?}", original_path, new_path);
 
     // Update the Length property in the UNICODE_STRING struct with the new length of the path.
@@ -363,4 +408,29 @@ unsafe extern "system" fn findfirstfileexw_detour(
         search_filter,
         additional_flags
     )
+}
+
+
+unsafe extern "system" fn loadlibraryw_detour(lpfilename: PCWSTR) -> HMODULE {
+    let path = utils::pcwstr_to_path(lpfilename);
+    let new_path = utils::reroot_path(&path).unwrap_or(path.0.clone());
+    debug!("[loadlibraryw_detour] {:?} to {:?}", path, new_path);
+
+    let wide_path = utils::path_to_widestring(&new_path);
+
+    let raw_path = wide_path.as_ptr();
+
+    LoadLibraryW_Detour.call(raw_path)
+}
+
+unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut c_void {
+    let path = utils::pcwstr_to_path(lppathnamestr);
+    let new_path = utils::reroot_path(&path).unwrap_or(path.0.clone());
+    
+    debug!("[adddlldirectory_detour] {:?} to {:?}", path, new_path);
+
+    let wide_path = utils::path_to_widestring(&new_path);
+    let raw_path = wide_path.as_ptr();
+
+    AddDllDirectory_Detour.call(raw_path)
 }
