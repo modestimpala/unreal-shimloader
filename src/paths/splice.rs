@@ -124,4 +124,94 @@ mod tests {
         let result = splice_path(&path, &source, &target);
         assert_eq!(result, None);
     }
+
+    // Test case matching the real-world DLL loading scenario
+    #[test]
+    fn test_dll_path_remapping() {
+        let path = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods\AutoIntegrator\dlls\main.dll");
+        let source = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods");
+        let target = NormalizedPath::new(r"C:\Users\Test\Mods");
+
+        let result = splice_path(&path, &source, &target);
+        assert_eq!(result, Some(PathBuf::from(r"C:\Users\Test\Mods\autointegrator\dlls\main.dll")));
+    }
+
+    // Test case: source path built with .join() like in lib.rs
+    #[test]
+    fn test_exe_dir_join_mods() {
+        // Simulating EXE_DIR.join("Mods") where EXE_DIR comes from env::current_exe().parent()
+        let exe_dir = PathBuf::from(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64");
+        let source = NormalizedPath::new(exe_dir.join("Mods"));
+        
+        let path = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods\AutoIntegrator\dlls\main.dll");
+        let target = NormalizedPath::new(r"C:\Users\Test\MyMods");
+
+        println!("Source inner: {:?}", source.inner());
+        println!("Path inner: {:?}", path.inner());
+        println!("Path starts_with source: {}", path.starts_with(&source));
+
+        let result = splice_path(&path, &source, &target);
+        assert!(result.is_some(), "Path should be remapped");
+        println!("Result: {:?}", result);
+    }
+
+    // Test case: extended-length path prefix (\\?\)
+    #[test]
+    fn test_extended_length_path() {
+        let path = NormalizedPath::new(r"\\?\D:\Games\Mods\test.dll");
+        let source = NormalizedPath::new(r"D:\Games\Mods");
+        let target = NormalizedPath::new(r"C:\MyMods");
+
+        println!("Path inner: {:?}", path.inner());
+        println!("Source inner: {:?}", source.inner());
+        println!("Path starts_with source: {}", path.starts_with(&source));
+
+        let result = splice_path(&path, &source, &target);
+        // Extended-length paths have different prefix component - they won't match!
+        println!("Result: {:?}", result);
+    }
+
+    // Test what happens if source is registered with trailing backslash
+    #[test]
+    fn test_trailing_separator_mismatch() {
+        let path = NormalizedPath::new(r"D:\Games\Mods\test.dll");
+        let source_with_slash = NormalizedPath::new(r"D:\Games\Mods\");
+        let source_without = NormalizedPath::new(r"D:\Games\Mods");
+        let target = NormalizedPath::new(r"C:\MyMods");
+
+        println!("Path inner: {:?}", path.inner());
+        println!("Source with trailing: {:?}", source_with_slash.inner());
+        println!("Source without trailing: {:?}", source_without.inner());
+        
+        let result1 = splice_path(&path, &source_with_slash, &target);
+        let result2 = splice_path(&path, &source_without, &target);
+        
+        println!("Result with trailing slash source: {:?}", result1);
+        println!("Result without trailing slash source: {:?}", result2);
+    }
+
+    // Test exact lib.rs scenario
+    #[test]
+    fn test_lib_rs_registration_scenario() {
+        use std::path::PathBuf;
+        
+        // Simulate EXE_DIR from env::current_exe().parent()
+        let exe_dir = PathBuf::from(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64");
+        
+        // This is how lib.rs registers: registry.register(EXE_DIR.join("Mods"), ...)
+        let source = NormalizedPath::new(exe_dir.join("Mods"));
+        let target = NormalizedPath::new(r"C:\Users\Test\MyMods");
+        
+        println!("Source (from join): {:?}", source.inner());
+        
+        // This is the path UE4SS would try to access
+        let dll_path = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods\AutoIntegrator\dlls\main.dll");
+        
+        println!("DLL path: {:?}", dll_path.inner());
+        println!("starts_with: {}", dll_path.starts_with(&source));
+        
+        let result = splice_path(&dll_path, &source, &target);
+        assert!(result.is_some(), "DLL path should be remapped! Got: {:?}", result);
+        println!("Remapped: {:?}", result);
+    }
 }

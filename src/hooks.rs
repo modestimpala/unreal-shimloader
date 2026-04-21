@@ -29,7 +29,8 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FindClose, FindFileHandle, FindFirstFileExW, FindFirstFileW, FindNextFileW, GetFileAttributesExW, GetFileAttributesW, NtCreateFile, FILE_ATTRIBUTE_DIRECTORY, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, GET_FILEEX_INFO_LEVELS, NT_CREATE_FILE_DISPOSITION, WIN32_FIND_DATAW
 };
-use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, AddDllDirectory};
+use windows_sys::Win32::System::Environment::GetCommandLineW;
+use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, LoadLibraryExW, AddDllDirectory, LOAD_LIBRARY_FLAGS};
 use windows_sys::Win32::System::WindowsProgramming::{
     IO_STATUS_BLOCK,
     IO_STATUS_BLOCK_0,
@@ -94,8 +95,28 @@ static_detour! {
 
     pub static LoadLibraryW_Detour: unsafe extern "system" fn(PCWSTR) -> HMODULE;
 
+    pub static LoadLibraryExW_Detour: unsafe extern "system" fn(PCWSTR, HANDLE, LOAD_LIBRARY_FLAGS) -> HMODULE;
+
     pub static AddDllDirectory_Detour: unsafe extern "system" fn(PCWSTR) -> *mut c_void;
+
+    pub static GetCommandLineW_Detour: unsafe extern "system" fn() -> PCWSTR;
 }
+
+/// Switches that the shimloader consumes itself. They (and their following value)
+/// must be stripped from the command line before the game's own parser sees them,
+/// otherwise UE5's `FCommandLine`/`UGameInstance::StartGameInstance` interprets the
+/// path that follows as a map URL and pops a "map could not be found" dialog.
+const SHIMLOADER_SWITCHES: &[&str] = &["--mod-dir", "--pak-dir", "--cfg-dir"];
+
+/// Cached, sanitized copy of the process command line. The pointer returned by
+/// `getcommandlinew_detour` must remain valid for the entire lifetime of the
+/// process, so we hold the backing storage in a `OnceCell`.
+static SANITIZED_COMMAND_LINE: Lazy<U16CString> = Lazy::new(|| unsafe {
+    let original_ptr = GetCommandLineW_Detour.call();
+    let original = U16CStr::from_ptr_str(original_ptr).as_slice();
+    let cleaned = sanitize_command_line(original);
+    U16CString::from_vec_truncate(cleaned)
+});
 
 
 pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
@@ -147,8 +168,16 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
         loadlibraryw_detour(lpfilename)
     })?.enable()?;
 
+    LoadLibraryExW_Detour.initialize(LoadLibraryExW, |lpfilename, hfile, dwflags| unsafe {
+        loadlibraryexw_detour(lpfilename, hfile, dwflags)
+    })?.enable()?;
+
     AddDllDirectory_Detour.initialize(AddDllDirectory, |lppathnamestr| unsafe {
         adddlldirectory_detour(lppathnamestr) 
+    })?.enable()?;
+
+    GetCommandLineW_Detour.initialize(GetCommandLineW, || unsafe {
+        getcommandlinew_detour()
     })?.enable()?;
     
 
@@ -415,6 +444,19 @@ unsafe extern "system" fn loadlibraryw_detour(lpfilename: PCWSTR) -> HMODULE {
     LoadLibraryW_Detour.call(raw_path)
 }
 
+/// Required for experimental UE4SS debug builds. As of ed989df they use LoadLibraryExW to load their DLLs instead of LoadLibraryW
+unsafe extern "system" fn loadlibraryexw_detour(lpfilename: PCWSTR, hfile: HANDLE, dwflags: LOAD_LIBRARY_FLAGS) -> HMODULE {
+    let path = paths::pcwstr_to_path(lpfilename);
+    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
+    debug!("[loadlibraryexw_detour] {:?} to {:?}", path, new_path);
+
+    let wide_path = paths::path_to_widestring(&new_path);
+
+    let raw_path = wide_path.as_ptr();
+
+    LoadLibraryExW_Detour.call(raw_path, hfile, dwflags)
+}
+
 unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut c_void {
     let path = paths::pcwstr_to_path(lppathnamestr);
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
@@ -425,4 +467,101 @@ unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut 
     let raw_path = wide_path.as_ptr();
 
     AddDllDirectory_Detour.call(raw_path)
+}
+
+unsafe extern "system" fn getcommandlinew_detour() -> PCWSTR {
+    SANITIZED_COMMAND_LINE.as_ptr()
+}
+
+/// Tokenize a Windows command line and emit a copy with the shimloader's own
+/// switches (and the value following each one) removed. Whitespace and quoting
+/// inside the surviving tokens is preserved verbatim.
+fn sanitize_command_line(input: &[u16]) -> Vec<u16> {
+    let tokens = tokenize_command_line(input);
+
+    let mut keep = vec![true; tokens.len()];
+    let mut skip_next = false;
+    for (i, tok) in tokens.iter().enumerate() {
+        if skip_next {
+            keep[i] = false;
+            skip_next = false;
+            continue;
+        }
+
+        let unquoted = unquote_token(&input[tok.start..tok.end]);
+        if SHIMLOADER_SWITCHES.iter().any(|s| unquoted.eq_ignore_ascii_case(s)) {
+            keep[i] = false;
+            skip_next = true;
+        }
+    }
+
+    let mut out: Vec<u16> = Vec::with_capacity(input.len());
+    let mut first_kept = true;
+    for (i, tok) in tokens.iter().enumerate() {
+        if !keep[i] {
+            continue;
+        }
+
+        if first_kept {
+            // Preserve the original leading whitespace and argv[0] verbatim.
+            out.extend_from_slice(&input[..tok.end]);
+            first_kept = false;
+        } else {
+            out.push(b' ' as u16);
+            out.extend_from_slice(&input[tok.start..tok.end]);
+        }
+    }
+
+    out
+}
+
+struct CmdToken {
+    start: usize,
+    end: usize,
+}
+
+/// Split a wide command line into token byte ranges, honouring double-quote
+/// grouping so that paths containing spaces are kept intact.
+fn tokenize_command_line(input: &[u16]) -> Vec<CmdToken> {
+    const SPACE: u16 = b' ' as u16;
+    const TAB: u16 = b'\t' as u16;
+    const QUOTE: u16 = b'"' as u16;
+
+    let mut tokens = Vec::new();
+    let mut i = 0;
+    while i < input.len() {
+        // Skip whitespace between tokens.
+        while i < input.len() && (input[i] == SPACE || input[i] == TAB) {
+            i += 1;
+        }
+        if i >= input.len() {
+            break;
+        }
+
+        let start = i;
+        let mut in_quote = false;
+        while i < input.len() {
+            let c = input[i];
+            if c == QUOTE {
+                in_quote = !in_quote;
+            } else if !in_quote && (c == SPACE || c == TAB) {
+                break;
+            }
+            i += 1;
+        }
+        tokens.push(CmdToken { start, end: i });
+    }
+    tokens
+}
+
+/// Strip a single layer of surrounding double quotes from a wide token and
+/// decode the result for switch comparison. Non-UTF16 sequences are skipped.
+fn unquote_token(token: &[u16]) -> String {
+    const QUOTE: u16 = b'"' as u16;
+    let trimmed = if token.len() >= 2 && token[0] == QUOTE && token[token.len() - 1] == QUOTE {
+        &token[1..token.len() - 1]
+    } else {
+        token
+    };
+    String::from_utf16_lossy(trimmed)
 }
