@@ -112,7 +112,7 @@ static_detour! {
 /// must be stripped from the command line before the game's own parser sees them,
 /// otherwise UE5's `FCommandLine`/`UGameInstance::StartGameInstance` interprets the
 /// path that follows as a map URL and pops a "map could not be found" dialog.
-const SHIMLOADER_SWITCHES: &[&str] = &["--mod-dir", "--pak-dir", "--cfg-dir"];
+const SHIMLOADER_SWITCHES: &[&str] = &["--mod-dir", "--pak-dir", "--cfg-dir", "--overlay-dir"];
 
 /// Cached, sanitized copy of the process command line. The pointer returned by
 /// `getcommandlinew_detour` must remain valid for the entire lifetime of the

@@ -92,6 +92,19 @@ impl PathRegistry {
         exe_dir: &Path,
         claimed: &mut HashSet<NormalizedPath>,
     ) {
+        // Tombstone applies to the directory it lives in. Mask the dir and
+        // skip its contents entirely so a wrapper can't accidentally ship
+        // overlay files under a removed path.
+        let tombstone = current.join(TOMBSTONE_FILENAME);
+        if tombstone.is_file() {
+            if current == root {
+                error!("[overlay] ignoring tombstone at wrapper root: {tombstone:?}");
+            } else if let Ok(rel) = current.strip_prefix(root) {
+                self.register_mask(exe_dir.join(rel));
+                return;
+            }
+        }
+
         let entries = match fs::read_dir(current) {
             Ok(it) => it,
             Err(e) => {
@@ -106,34 +119,23 @@ impl PathRegistry {
                 self.register_overlay_subtree(root, &path, exe_dir, claimed);
                 continue;
             }
+            if path.file_name().is_some_and(|n| n == TOMBSTONE_FILENAME) {
+                continue;
+            }
 
             let rel = match path.strip_prefix(root) {
                 Ok(r) => r.to_path_buf(),
                 Err(_) => continue,
             };
-
-            let is_tombstone = path.file_name().is_some_and(|n| n == TOMBSTONE_FILENAME);
-
-            if is_tombstone {
-                let parent_rel = match rel.parent() {
-                    Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-                    _ => {
-                        error!("[overlay] ignoring tombstone at wrapper root: {path:?}");
-                        continue;
-                    }
-                };
-                self.register_mask(exe_dir.join(parent_rel));
-            } else {
-                let logical = NormalizedPath::new(exe_dir.join(&rel));
-                if !claimed.insert(logical.clone()) {
-                    error!(
-                        "[overlay] collision: {:?} already overlaid by an earlier wrapper, ignoring {:?}",
-                        logical, path
-                    );
-                    continue;
-                }
-                self.register(logical, path);
+            let logical = NormalizedPath::new(exe_dir.join(&rel));
+            if !claimed.insert(logical.clone()) {
+                error!(
+                    "[overlay] collision: {:?} already overlaid by an earlier wrapper, ignoring {:?}",
+                    logical, path
+                );
+                continue;
             }
+            self.register(logical, path);
         }
     }
 
