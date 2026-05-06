@@ -37,7 +37,7 @@ static GAME_ROOT: Lazy<PathBuf> = Lazy::new(|| {
     current_exe
         .ancestors()
         .nth(3)
-        .unwrap_or_else(|| 
+        .unwrap_or_else(||
             panic!("The executable at {current_exe:?} is not contained within a valid UE directory structure."))
         .to_path_buf()
 });
@@ -86,7 +86,7 @@ unsafe fn shim_init() {
     let current_exe = env::current_exe()
         .expect("Failed to get the path of the currently running executable.");
     let exe_dir = current_exe.parent().unwrap();
- 
+
     let mut target = Box::new(File::create(exe_dir.join("shimloader-log.txt")).expect("Failed to create log file."));
     env_logger::Builder::new()
         .target(env_logger::Target::Pipe(target))
@@ -112,7 +112,7 @@ unsafe fn shim_init() {
     // Ensure that UE4SS is not installed via xinput1_3.dll
     let xinput_path = exe_dir.join("xinput1_3.dll");
     assert!(
-        !xinput_path.exists(), 
+        !xinput_path.exists(),
         "Shimloader is not compatible with the xinput1_3.dll UE4SS binary.\n
         1. Remove the file at {xinput_path:?} \n
         2. Ensure that ue4ss.dll exists within {exe_dir:?} \n
@@ -125,12 +125,14 @@ unsafe fn shim_init() {
     let mut lua_dir: Option<PathBuf> = None;
     let mut pak_dir: Option<PathBuf> = None;
     let mut cfg_dir: Option<PathBuf> = None;
+    let mut overlay_dir: Option<PathBuf> = None;
 
     while let Some(opt) = opts.next_arg().expect("Failed to parse arguments") {
         match opt {
             Arg::Long("mod-dir") => lua_dir = Some(PathBuf::from(opts.value().expect("`--mod-dir` argument has no value."))),
             Arg::Long("pak-dir") => pak_dir = Some(PathBuf::from(opts.value().expect("`--pak-dir` argument has no value."))),
             Arg::Long("cfg-dir") => cfg_dir = Some(PathBuf::from(opts.value().expect("`--cfg-dir` argument has no value."))),
+            Arg::Long("overlay-dir") => overlay_dir = Some(PathBuf::from(opts.value().expect("`--overlay-dir` argument has no value."))),
             _ => (),
         }
     }
@@ -144,7 +146,7 @@ unsafe fn shim_init() {
     let toplevel_dir = current_exe
         .ancestors()
         .nth(3)
-        .unwrap_or_else(|| 
+        .unwrap_or_else(||
             panic!("The executable at {current_exe:?} is not contained within a valid UE directory structure."));
 
     // Validation to ensure that the Content/Paks/LogicMods directory exists in the game directory.
@@ -173,13 +175,18 @@ unsafe fn shim_init() {
     for dir in [ue4ss_mods.as_ref(), bp_mods.as_ref(), config_dir.as_ref()] {
         let _ = fs::create_dir_all(dir);
     }
-    
+
     // Build the path registry with all virtual directory mappings.
     let mut registry = PathRegistry::new();
 
+    // Overlays first: first-match-wins puts wrapper files ahead of mod-dir.
+    if let Some(overlay) = overlay_dir.as_ref() {
+        registry.register_overlay_dir(overlay, EXE_DIR.as_path());
+    }
+
     // Lua mods: GAME/Binaries/Win64/Mods/ -> user's mod directory
     registry.register(EXE_DIR.join("Mods"), ue4ss_mods.to_path_buf());
-    
+
     // Blueprint mods: GAME/Content/Paks/LogicMods/ -> user's pak directory
     // NormalizedPath automatically cleans .. components
     let bp_source = EXE_DIR
@@ -189,7 +196,7 @@ unsafe fn shim_init() {
         .join("Paks")
         .join("LogicMods");
     registry.register(bp_source, bp_mods.to_path_buf());
-    
+
     // Config: GAME/Config/ -> user's config directory
     let config_source = EXE_DIR
         .join("..")
