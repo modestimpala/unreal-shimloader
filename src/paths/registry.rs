@@ -225,6 +225,21 @@ mod tests {
     }
 
     #[test]
+    fn test_mask_shadows_overlapping_remap_source() {
+        // If a wrapper ships `.shim-removed` inside e.g. `Mods/`, the overlay
+        // scan registers a mask at `exe_dir/Mods`, which is also the source
+        // of the user's structural mod-dir mapping. Detours consult is_masked
+        // before try_remap, so the entire user mod dir becomes unreachable.
+        let mut registry = PathRegistry::new();
+        registry.register_mask("C:\\Game\\Win64\\Mods");
+        registry.register("C:\\Game\\Win64\\Mods", "D:\\UserMods");
+
+        let mod_file = NormalizedPath::new("C:\\Game\\Win64\\Mods\\SomeMod\\main.lua");
+        assert!(registry.is_masked(&mod_file));
+        assert!(registry.try_remap(&mod_file).is_some());
+    }
+
+    #[test]
     fn test_registry_first_match_wins() {
         let mut registry = PathRegistry::new();
         // More specific mapping first
