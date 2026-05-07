@@ -8,6 +8,10 @@ pub fn remap_path(path: &NormalizedPath) -> Option<PathBuf> {
     PATH_REGISTRY.get().and_then(|registry| registry.try_remap(path))
 }
 
+pub fn is_masked(path: &NormalizedPath) -> bool {
+    PATH_REGISTRY.get().is_some_and(|registry| registry.is_masked(path))
+}
+
 /// Splice a path from one root onto another.
 /// Returns the remapped path if `path` starts with `source_root`, otherwise None.
 pub fn splice_path(
@@ -20,7 +24,12 @@ pub fn splice_path(
     }
 
     let relative = path.strip_prefix(source_root)?;
-    let result = target_root.to_path_buf().join(relative);
+    // Avoid Path::join(""): Win32 CreateFile rejects file paths ending in `\`.
+    let result = if relative.as_os_str().is_empty() {
+        target_root.to_path_buf()
+    } else {
+        target_root.to_path_buf().join(relative)
+    };
 
     Some(result)
 }
@@ -83,6 +92,19 @@ mod tests {
     }
 
     #[test]
+    fn test_splice_path_exact_match_no_trailing_separator() {
+        // PathBuf component-equality hides trailing `\`, check raw bytes.
+        let path = NormalizedPath::new("C:\\Game\\Win64\\UE4SS-settings.ini");
+        let source = NormalizedPath::new("C:\\Game\\Win64\\UE4SS-settings.ini");
+        let target = NormalizedPath::new("D:\\overlay\\Wrap\\UE4SS-settings.ini");
+
+        let result = splice_path(&path, &source, &target).unwrap();
+        let bytes = result.as_os_str().to_string_lossy();
+        assert!(!bytes.ends_with('\\'), "remap target must not end with backslash, got {bytes:?}");
+        assert_eq!(bytes, "D:\\overlay\\Wrap\\UE4SS-settings.ini");
+    }
+
+    #[test]
     fn test_splice_path_case_insensitive() {
         let path = NormalizedPath::new("C:\\GAME\\MODS\\test.lua");
         let source = NormalizedPath::new("c:\\game\\mods");
@@ -142,7 +164,7 @@ mod tests {
         // Simulating EXE_DIR.join("Mods") where EXE_DIR comes from env::current_exe().parent()
         let exe_dir = PathBuf::from(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64");
         let source = NormalizedPath::new(exe_dir.join("Mods"));
-        
+
         let path = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods\AutoIntegrator\dlls\main.dll");
         let target = NormalizedPath::new(r"C:\Users\Test\MyMods");
 
@@ -182,10 +204,10 @@ mod tests {
         println!("Path inner: {:?}", path.inner());
         println!("Source with trailing: {:?}", source_with_slash.inner());
         println!("Source without trailing: {:?}", source_without.inner());
-        
+
         let result1 = splice_path(&path, &source_with_slash, &target);
         let result2 = splice_path(&path, &source_without, &target);
-        
+
         println!("Result with trailing slash source: {:?}", result1);
         println!("Result without trailing slash source: {:?}", result2);
     }
@@ -194,22 +216,22 @@ mod tests {
     #[test]
     fn test_lib_rs_registration_scenario() {
         use std::path::PathBuf;
-        
+
         // Simulate EXE_DIR from env::current_exe().parent()
         let exe_dir = PathBuf::from(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64");
-        
+
         // This is how lib.rs registers: registry.register(EXE_DIR.join("Mods"), ...)
         let source = NormalizedPath::new(exe_dir.join("Mods"));
         let target = NormalizedPath::new(r"C:\Users\Test\MyMods");
-        
+
         println!("Source (from join): {:?}", source.inner());
-        
+
         // This is the path UE4SS would try to access
         let dll_path = NormalizedPath::new(r"D:\Games\steamapps\common\ASTRONEER\Astro\Binaries\Win64\Mods\AutoIntegrator\dlls\main.dll");
-        
+
         println!("DLL path: {:?}", dll_path.inner());
         println!("starts_with: {}", dll_path.starts_with(&source));
-        
+
         let result = splice_path(&dll_path, &source, &target);
         assert!(result.is_some(), "DLL path should be remapped! Got: {:?}", result);
         println!("Remapped: {:?}", result);

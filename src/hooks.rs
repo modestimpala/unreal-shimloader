@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::{alloc, mem, ptr, slice};
 use std::alloc::Layout;
 use std::error::Error;
@@ -14,14 +15,17 @@ use widestring::{U16CStr, U16CString, WideString};
 use windows_sys::core::PCWSTR;
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{
-    GetLastError, 
-    SetLastError, 
-    BOOL, 
-    ERROR_NO_MORE_FILES, 
-    FILETIME, 
-    HANDLE, 
-    MAX_PATH, 
-    NTSTATUS, 
+    GetLastError,
+    SetLastError,
+    BOOL,
+    ERROR_FILE_NOT_FOUND,
+    ERROR_NO_MORE_FILES,
+    FILETIME,
+    HANDLE,
+    INVALID_HANDLE_VALUE,
+    MAX_PATH,
+    NTSTATUS,
+    STATUS_OBJECT_NAME_NOT_FOUND,
     UNICODE_STRING,
     HMODULE
 };
@@ -36,7 +40,9 @@ use windows_sys::Win32::System::WindowsProgramming::{
     IO_STATUS_BLOCK_0,
     OBJECT_ATTRIBUTES
 };
-use crate::paths::{self, NormalizedPath, remap_path};
+use crate::paths::{self, NormalizedPath, is_masked, remap_path};
+
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 
 
 static_detour! {
@@ -106,7 +112,7 @@ static_detour! {
 /// must be stripped from the command line before the game's own parser sees them,
 /// otherwise UE5's `FCommandLine`/`UGameInstance::StartGameInstance` interprets the
 /// path that follows as a map URL and pops a "map could not be found" dialog.
-const SHIMLOADER_SWITCHES: &[&str] = &["--mod-dir", "--pak-dir", "--cfg-dir"];
+const SHIMLOADER_SWITCHES: &[&str] = &["--mod-dir", "--pak-dir", "--cfg-dir", "--overlay-dir"];
 
 /// Cached, sanitized copy of the process command line. The pointer returned by
 /// `getcommandlinew_detour` must remain valid for the entire lifetime of the
@@ -164,6 +170,14 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
         findfirstfileexw_detour(a, b, c, d, e, f)
     })?.enable()?;
 
+    FindNextFileW_Detour.initialize(FindNextFileW, |a, b| unsafe {
+        findnextfilew_detour(a, b)
+    })?.enable()?;
+
+    FindClose_Detour.initialize(FindClose, |a| unsafe {
+        findclose_detour(a)
+    })?.enable()?;
+
     LoadLibraryW_Detour.initialize(LoadLibraryW, |lpfilename| unsafe {
         loadlibraryw_detour(lpfilename)
     })?.enable()?;
@@ -173,13 +187,13 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
     })?.enable()?;
 
     AddDllDirectory_Detour.initialize(AddDllDirectory, |lppathnamestr| unsafe {
-        adddlldirectory_detour(lppathnamestr) 
+        adddlldirectory_detour(lppathnamestr)
     })?.enable()?;
 
     GetCommandLineW_Detour.initialize(GetCommandLineW, || unsafe {
         getcommandlinew_detour()
     })?.enable()?;
-    
+
 
     Ok(())
 }
@@ -194,6 +208,11 @@ pub unsafe extern "system" fn createfilew_detour(
     template_file: HANDLE,
 ) -> HANDLE {
     let path = paths::pcwstr_to_path(raw_file_name);
+    if is_masked(&path) {
+        debug!("[createfilew_detour] masked: {:?}", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
 
     debug!("[createfilew_detour] {:?} to {:?}", path, new_path);
@@ -236,17 +255,17 @@ pub unsafe extern "system" fn ntcreatefile_detour(
 
     // Create a raw slice and handle potential nulls safely
     let slice = slice::from_raw_parts(offset_path, path_len - 4);
-    
+
     // Find the first null terminator, if any
     let null_pos = slice.iter().position(|&c| c == 0);
-    
+
     let effective_len = null_pos.unwrap_or(path_len - 4);
     let effective_slice = &slice[..effective_len];
-    
+
     // Use from_vec instead of from_slice
     let wide_string = WideString::from_vec(effective_slice.to_vec());
     let original_path_result = wide_string.to_string();
-    
+
     // Early return if we can't process the path
     if original_path_result.is_err() {
         return NtCreateFile_Detour.call(
@@ -263,9 +282,9 @@ pub unsafe extern "system" fn ntcreatefile_detour(
             ea_length
         );
     }
-    
+
     let original_path_str = original_path_result.unwrap();
-    
+
     let bad_path_prefixes = ["\\\\device", "c:\\windows"];
     if bad_path_prefixes.iter().any(|x| {
         let lowercase = original_path_str.to_lowercase();
@@ -288,8 +307,12 @@ pub unsafe extern "system" fn ntcreatefile_detour(
 
     let original_path = PathBuf::from(original_path_str);
     let new_path = NormalizedPath::new(&original_path);
+    if is_masked(&new_path) {
+        debug!("[ntcreatefile_detour] masked: {:?}", original_path);
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+    }
     let new_path = remap_path(&new_path).unwrap_or_else(|| new_path.to_path_buf());
-    
+
     debug!("[ntcreatefile_detour] {:?} to {:?}", original_path, new_path);
 
     // Update the Length property in the UNICODE_STRING struct with the new length of the path.
@@ -335,6 +358,11 @@ unsafe extern "system" fn getfileattributesw_detour(
     raw_file_name: PCWSTR,
 ) -> u32 {
     let path = paths::pcwstr_to_path(raw_file_name);
+    if is_masked(&path) {
+        debug!("[getfileattributesw_detour] masked: {:?}", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
 
     debug!("[getfileattributesw_detour] {:?} to {:?}", path, new_path);
@@ -358,21 +386,26 @@ unsafe extern "system" fn getfileattributesexw_detour(
     file_information: *mut c_void,
 ) -> BOOL {
     let path = paths::pcwstr_to_path(raw_file_name);
+    if is_masked(&path) {
+        debug!("[getfileattributesexw_detour] masked: {:?}", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
 
     debug!("[getfileattributesexw_detour] {:?} to {:?}", path, new_path);
-    
+
     let wide_path = paths::path_to_widestring(&new_path);
-    
+
     // Use the original Windows API to get attributes
     let attrs = GetFileAttributesW(wide_path.as_ptr());
-    
+
     // If the path doesn't exist, handle it properly
     if attrs == 0xFFFFFFFF {
         // The error is already set by GetFileAttributesW
         return 0;
     }
-    
+
     // Call the original function with our path
     GetFileAttributesExW_Detour.call(
         wide_path.as_ptr(),
@@ -381,11 +414,54 @@ unsafe extern "system" fn getfileattributesexw_detour(
     )
 }
 
+// Per-handle: pre-remap search dir, used by FindNextFileW to filter masked entries.
+static SEARCH_HANDLES: Lazy<Mutex<HashMap<isize, NormalizedPath>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+unsafe fn read_find_data_filename(find_data: *const WIN32_FIND_DATAW) -> String {
+    if find_data.is_null() {
+        return String::new();
+    }
+    let buf = (*find_data).cFileName;
+    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+    String::from_utf16_lossy(&buf[..len])
+}
+
+fn search_dir_for_pattern(pattern: &NormalizedPath) -> Option<NormalizedPath> {
+    pattern.original().parent().map(NormalizedPath::new)
+}
+
+unsafe fn advance_past_masked(
+    handle: HANDLE,
+    find_file_data: *mut WIN32_FIND_DATAW,
+    search_dir: &NormalizedPath,
+) -> bool {
+    loop {
+        let name = read_find_data_filename(find_file_data);
+        if name.is_empty() || name == "." || name == ".." {
+            return true;
+        }
+        let candidate = search_dir.join(&name);
+        if !is_masked(&candidate) {
+            return true;
+        }
+        debug!("[find filter] masked entry skipped: {:?}", candidate);
+        if FindNextFileW_Detour.call(handle, find_file_data) == 0 {
+            return false;
+        }
+    }
+}
+
 unsafe extern "system" fn findfirstfilew_detour(
     raw_file_name: PCWSTR,
     find_file_data: *mut WIN32_FIND_DATAW,
 ) -> FindFileHandle {
     let path = paths::pcwstr_to_path(raw_file_name);
+    if is_masked(&path) {
+        debug!("[findfirstfilew_detour] masked: {:?}", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
 
     debug!("[findfirstfilew_detour] {:?} to {:?}", path, new_path);
@@ -398,10 +474,24 @@ unsafe extern "system" fn findfirstfilew_detour(
         wide_path.as_ptr()
     };
 
-    FindFirstFileW_Detour.call(
-        raw_path,
-        find_file_data
-    )
+    let handle = FindFirstFileW_Detour.call(raw_path, find_file_data);
+    if handle == INVALID_HANDLE_VALUE {
+        return handle;
+    }
+
+    if let Some(search_dir) = search_dir_for_pattern(&path) {
+        if !advance_past_masked(handle, find_file_data, &search_dir) {
+            FindClose_Detour.call(handle);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+        SEARCH_HANDLES
+            .lock()
+            .unwrap()
+            .insert(handle, search_dir);
+    }
+
+    handle
 }
 
 unsafe extern "system" fn findfirstfileexw_detour(
@@ -413,6 +503,11 @@ unsafe extern "system" fn findfirstfileexw_detour(
     additional_flags: FIND_FIRST_EX_FLAGS
 ) -> FindFileHandle {
     let path = paths::pcwstr_to_path(raw_file_name);
+    if is_masked(&path) {
+        debug!("[findfirstfileexw_detour] masked: {:?}", path);
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
 
     debug!("[findfirstfileexw_detour] {:?} to {:?}", path, new_path);
@@ -421,14 +516,57 @@ unsafe extern "system" fn findfirstfileexw_detour(
 
     let raw_path = wide_path.as_ptr();
 
-    FindFirstFileExW_Detour.call(
+    let handle = FindFirstFileExW_Detour.call(
         raw_path,
         info_level_id,
         find_file_data,
         search_op,
         search_filter,
         additional_flags
-    )
+    );
+    if handle == INVALID_HANDLE_VALUE {
+        return handle;
+    }
+
+    if let Some(search_dir) = search_dir_for_pattern(&path) {
+        let win32_data = find_file_data.cast::<WIN32_FIND_DATAW>();
+        if !advance_past_masked(handle, win32_data, &search_dir) {
+            FindClose_Detour.call(handle);
+            SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+        SEARCH_HANDLES
+            .lock()
+            .unwrap()
+            .insert(handle, search_dir);
+    }
+
+    handle
+}
+
+unsafe extern "system" fn findnextfilew_detour(
+    handle: FindFileHandle,
+    find_file_data: *mut WIN32_FIND_DATAW,
+) -> BOOL {
+    let result = FindNextFileW_Detour.call(handle, find_file_data);
+    if result == 0 {
+        return result;
+    }
+
+    let search_dir = SEARCH_HANDLES.lock().unwrap().get(&handle).cloned();
+    if let Some(search_dir) = search_dir {
+        if !advance_past_masked(handle, find_file_data, &search_dir) {
+            SetLastError(ERROR_NO_MORE_FILES);
+            return 0;
+        }
+    }
+
+    1
+}
+
+unsafe extern "system" fn findclose_detour(handle: HANDLE) -> BOOL {
+    SEARCH_HANDLES.lock().unwrap().remove(&handle);
+    FindClose_Detour.call(handle)
 }
 
 
@@ -460,7 +598,7 @@ unsafe extern "system" fn loadlibraryexw_detour(lpfilename: PCWSTR, hfile: HANDL
 unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut c_void {
     let path = paths::pcwstr_to_path(lppathnamestr);
     let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-    
+
     debug!("[adddlldirectory_detour] {:?} to {:?}", path, new_path);
 
     let wide_path = paths::path_to_widestring(&new_path);
