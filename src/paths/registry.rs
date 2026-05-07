@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use log::{debug, error};
+use log::{debug, error, warn};
 
 use super::normalized::NormalizedPath;
 use super::splice::splice_path;
@@ -42,6 +42,12 @@ impl PathRegistry {
 
     pub fn register(&mut self, source: impl Into<NormalizedPath>, target: impl Into<NormalizedPath>) {
         let mapping = PathMapping::new(source, target);
+        if let Some(shadow) = self.masks.iter().find(|m| mapping.source.starts_with(m)) {
+            warn!(
+                "[PathRegistry] mapping source {:?} is shadowed by existing mask {:?}, remap will be unreachable",
+                mapping.source, shadow
+            );
+        }
         debug!(
             "[PathRegistry] Registered mapping: {:?} -> {:?}",
             mapping.source, mapping.target
@@ -51,6 +57,12 @@ impl PathRegistry {
 
     pub fn register_mask(&mut self, source: impl Into<NormalizedPath>) {
         let mask = source.into();
+        for shadowed in self.mappings.iter().filter(|m| m.source.starts_with(&mask)) {
+            warn!(
+                "[PathRegistry] mask {:?} shadows existing mapping source {:?}, remap will be unreachable",
+                mask, shadowed.source
+            );
+        }
         debug!("[PathRegistry] Registered mask: {:?}", mask);
         self.masks.push(mask);
     }
