@@ -176,6 +176,17 @@ unsafe fn shim_init() {
         let _ = fs::create_dir_all(dir);
     }
 
+    // Publish resolved paths so overlay-loaded wrapper DLLs can discover
+    // them. The shimloader command line is sanitized before the rest of the
+    // process sees it, so a wrapper has no other portable way to recover
+    // these without parsing logs or walking the PEB.
+    env::set_var("SHIMLOADER_MOD_DIR", ue4ss_mods.as_ref());
+    env::set_var("SHIMLOADER_PAK_DIR", bp_mods.as_ref());
+    env::set_var("SHIMLOADER_CFG_DIR", config_dir.as_ref());
+    if let Some(overlay) = overlay_dir.as_ref() {
+        env::set_var("SHIMLOADER_OVERLAY_DIR", overlay);
+    }
+
     // Build the path registry with all virtual directory mappings.
     let mut registry = PathRegistry::new();
 

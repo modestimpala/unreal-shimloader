@@ -30,6 +30,17 @@ unreal-shimloader is controlled via the following arguments:
 `--overlay-dir`: The path of a directory containing one or more wrapper-package subdirectories. Each wrapper's file tree is overlaid onto `GAME/Binaries/Win64/`.
 - Maps to `GAME/Binaries/Win64`
 
+### Environment variables
+
+After parsing its command line, shimloader publishes the resolved paths into the process environment so overlay-loaded wrapper DLLs can read them without re-parsing the (sanitized) command line:
+
+- `SHIMLOADER_MOD_DIR`: value of `--mod-dir`
+- `SHIMLOADER_PAK_DIR`: value of `--pak-dir`
+- `SHIMLOADER_CFG_DIR`: value of `--cfg-dir`
+- `SHIMLOADER_OVERLAY_DIR`: value of `--overlay-dir`, only set when the switch is provided
+
+These are set before `ue4ss.dll` is loaded, so anything pulled in via the overlay can read them from `DllMain` with `GetEnvironmentVariableW`.
+
 ### Thanks
 
 A special thanks goes out to modestimpala who has contributed greatly to improving this project.
