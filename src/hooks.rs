@@ -12,7 +12,7 @@ use log::{debug, error};
 use once_cell::sync::Lazy;
 use retour::static_detour;
 use widestring::{U16CStr, U16CString, WideString};
-use windows_sys::core::PCWSTR;
+use windows_sys::core::{PCWSTR, PWSTR};
 use windows_sys::w;
 use windows_sys::Win32::Foundation::{
     GetLastError,
@@ -34,13 +34,13 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FindClose, FindFileHandle, FindFirstFileExW, FindFirstFileW, FindNextFileW, GetFileAttributesExW, GetFileAttributesW, NtCreateFile, FILE_ATTRIBUTE_DIRECTORY, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, GET_FILEEX_INFO_LEVELS, NT_CREATE_FILE_DISPOSITION, WIN32_FIND_DATAW
 };
 use windows_sys::Win32::System::Environment::GetCommandLineW;
-use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, LoadLibraryExW, AddDllDirectory, LOAD_LIBRARY_FLAGS};
+use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, LoadLibraryExW, AddDllDirectory, GetModuleFileNameW, LOAD_LIBRARY_FLAGS};
 use windows_sys::Win32::System::WindowsProgramming::{
     IO_STATUS_BLOCK,
     IO_STATUS_BLOCK_0,
     OBJECT_ATTRIBUTES
 };
-use crate::paths::{self, NormalizedPath, is_masked, remap_path};
+use crate::paths::{self, NormalizedPath, is_masked, remap_path, reverse_remap};
 
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
 
@@ -106,6 +106,8 @@ static_detour! {
     pub static AddDllDirectory_Detour: unsafe extern "system" fn(PCWSTR) -> *mut c_void;
 
     pub static GetCommandLineW_Detour: unsafe extern "system" fn() -> PCWSTR;
+
+    pub static GetModuleFileNameW_Detour: unsafe extern "system" fn(HMODULE, PWSTR, u32) -> u32;
 }
 
 /// Switches that the shimloader consumes itself. They (and their following value)
@@ -192,6 +194,10 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
 
     GetCommandLineW_Detour.initialize(GetCommandLineW, || unsafe {
         getcommandlinew_detour()
+    })?.enable()?;
+
+    GetModuleFileNameW_Detour.initialize(GetModuleFileNameW, |h, b, s| unsafe {
+        getmodulefilenamew_detour(h, b, s)
     })?.enable()?;
 
 
@@ -609,6 +615,48 @@ unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut 
 
 unsafe extern "system" fn getcommandlinew_detour() -> PCWSTR {
     SANITIZED_COMMAND_LINE.as_ptr()
+}
+
+/// Spoof `GetModuleFileNameW` results for overlay-loaded modules so callers
+/// see the logical Win64 path. Without this, UE4SS derives its mods/settings/log
+/// dirs from the wrapper location and bypasses Win64-relative detours.
+unsafe extern "system" fn getmodulefilenamew_detour(
+    h_module: HMODULE,
+    lp_filename: PWSTR,
+    n_size: u32,
+) -> u32 {
+    let result = GetModuleFileNameW_Detour.call(h_module, lp_filename, n_size);
+    if result == 0 || n_size == 0 {
+        return result;
+    }
+
+    let written = result as usize;
+    let buf_slice = slice::from_raw_parts(lp_filename, written);
+    let actual_str = match WideString::from_vec(buf_slice.to_vec()).to_string() {
+        Ok(s) => s,
+        Err(_) => return result,
+    };
+
+    let actual_path = NormalizedPath::new(&actual_str);
+    let Some(source_path) = reverse_remap(&actual_path) else {
+        return result;
+    };
+
+    let source_str = source_path.to_string_lossy();
+    let Ok(source_wide) = U16CString::from_str(source_str.as_ref()) else {
+        return result;
+    };
+
+    let with_nul = source_wide.as_slice_with_nul();
+    if with_nul.len() as u32 <= n_size {
+        ptr::copy_nonoverlapping(with_nul.as_ptr(), lp_filename, with_nul.len());
+        (with_nul.len() - 1) as u32
+    } else {
+        // Win XP+ behavior on overflow: truncate, no null terminator, return n_size.
+        ptr::copy_nonoverlapping(with_nul.as_ptr(), lp_filename, n_size as usize);
+        SetLastError(windows_sys::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER);
+        n_size
+    }
 }
 
 /// Tokenize a Windows command line and emit a copy with the shimloader's own

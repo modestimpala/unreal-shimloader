@@ -12,6 +12,11 @@ pub fn is_masked(path: &NormalizedPath) -> bool {
     PATH_REGISTRY.get().is_some_and(|registry| registry.is_masked(path))
 }
 
+/// Reverse-map a path through the global path registry.
+pub fn reverse_remap(path: &NormalizedPath) -> Option<PathBuf> {
+    PATH_REGISTRY.get().and_then(|registry| registry.reverse_lookup(path))
+}
+
 /// Splice a path from one root onto another.
 /// Returns the remapped path if `path` starts with `source_root`, otherwise None.
 pub fn splice_path(
