@@ -114,4 +114,13 @@ fn main() {
             (202, "DwmUpdateThumbnailProperties")
         ],
     ).unwrap();
+
+    let mut res = winresource::WindowsResource::new();
+    res.set("OriginalFilename", "dwmapi.dll");
+    res.set("InternalName", "dwmapi");
+    res.set("ProductName", "unreal_shimloader");
+    res.set("FileDescription", "Thunderstore Mod Manager support shim for RE-UE4SS");
+    res.set("CompanyName", "Thunderstore");
+    res.set("LegalCopyright", "Copyright (c) Thunderstore");
+    res.compile().unwrap();
 }

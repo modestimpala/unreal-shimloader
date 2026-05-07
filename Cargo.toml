@@ -25,3 +25,4 @@ features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "W
 
 [build-dependencies]
 forward-dll = "0.1.13"
+winresource = "0.1"

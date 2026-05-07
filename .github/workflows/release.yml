@@ -34,6 +34,14 @@ jobs:
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Sync Cargo manifest version to release version
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          sed -i '/^\[package\]/,/^\[/ { /^version = / s/".*"/"'"$version"'"/ }' Cargo.toml
+          sed -i '/^name = "unreal-shimloader"/,/^version/ { /^version = / s/".*"/"'"$version"'"/ }' Cargo.lock
+          echo "Cargo.toml: $(grep -m1 '^version = ' Cargo.toml)"
+          echo "Cargo.lock: $(grep -A1 '^name = "unreal-shimloader"' Cargo.lock | tail -n 1)"
+
       - name: Build
         run: cargo build --release --locked
 
