@@ -2,10 +2,14 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['*']
 
 permissions:
   contents: write
+
+defaults:
+  run:
+    shell: bash
 
 jobs:
   release:
@@ -13,25 +17,68 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Resolve version from tag
+        id: version
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version="${tag#v}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "Tag '$tag' is not Thunderstore-compatible. Expected X.Y.Z (optionally v-prefixed)." >&2
+              exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Build
         run: cargo build --release --locked
 
-      - name: Sign
-        uses: Azure/trusted-signing-action@v0.5.1
-        with:
-          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
-          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
-          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
-          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
-          files-folder: target/release
-          files-folder-filter: dll
-          file-digest: SHA256
-          timestamp-rfc3161: http://timestamp.acs.microsoft.com
-          timestamp-digest: SHA256
+      # Trusted Signing temporarily disabled.
+      # - name: Sign
+      #   uses: Azure/trusted-signing-action@v0.5.1
+      #   with:
+      #     azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+      #     azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      #     azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+      #     endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+      #     trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+      #     certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+      #     files-folder: target/release
+      #     files-folder-filter: dll
+      #     file-digest: SHA256
+      #     timestamp-rfc3161: http://timestamp.acs.microsoft.com
+      #     timestamp-digest: SHA256
+
+      - name: Package shimloader binary zip
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          zip -j "unreal_shimloader-$version.zip" target/release/dwmapi.dll
+
+      - name: Package Thunderstore zip
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          stage=ts-stage
+          mkdir "$stage"
+          cp ts/icon.png "$stage/"
+          cp README.md "$stage/"
+          cp -r ts/UE4SS "$stage/"
+          cp target/release/dwmapi.dll "$stage/"
+          cat > "$stage/manifest.json" <<EOF
+          {
+              "name": "unreal_shimloader",
+              "author": "Thunderstore",
+              "version_number": "$version",
+              "website_url": "https://github.com/thunderstore-io/unreal-shimloader",
+              "description": "Thunderstore Mod Manager and r2modmanPlus support for RE-UE4SS.",
+              "dependencies": []
+          }
+          EOF
+          (cd "$stage" && zip -r "../Thunderstore-unreal_shimloader-$version.zip" .)
 
       - name: Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$env:GITHUB_REF_NAME" target/release/dwmapi.dll --generate-notes
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          gh release create "$GITHUB_REF_NAME" \
+              "unreal_shimloader-$version.zip" \
+              "Thunderstore-unreal_shimloader-$version.zip" \
+              --generate-notes
