@@ -50,7 +50,7 @@ jobs:
       - name: Package shimloader binary zip
         run: |
           version="${{ steps.version.outputs.version }}"
-          zip -j "unreal_shimloader-$version.zip" target/release/dwmapi.dll
+          (cd target/release && 7z a -tzip "../../unreal_shimloader-$version.zip" dwmapi.dll)
 
       - name: Package Thunderstore zip
         run: |
@@ -71,7 +71,7 @@ jobs:
               "dependencies": []
           }
           EOF
-          (cd "$stage" && zip -r "../Thunderstore-unreal_shimloader-$version.zip" .)
+          (cd "$stage" && 7z a -tzip "../Thunderstore-unreal_shimloader-$version.zip" .)
 
       - name: Release
         env:
