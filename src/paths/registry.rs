@@ -164,6 +164,16 @@ impl PathRegistry {
         self.masks.iter().any(|m| path.starts_with(m))
     }
 
+    /// Reverse of `try_remap`: maps a target-side path back to its source.
+    pub fn reverse_lookup(&self, path: &NormalizedPath) -> Option<PathBuf> {
+        for mapping in &self.mappings {
+            if let Some(remapped) = splice_path(path, &mapping.target, &mapping.source) {
+                return Some(remapped);
+            }
+        }
+        None
+    }
+
     pub fn would_remap(&self, path: &NormalizedPath) -> bool {
         self.try_remap(path).is_some()
     }
@@ -234,6 +244,39 @@ mod tests {
             registry.try_remap(&unmasked),
             Some(PathBuf::from("D:\\MyMods\\othermod\\foo.lua"))
         );
+    }
+
+    #[test]
+    fn test_reverse_lookup_overlay_file_mapping() {
+        let mut registry = PathRegistry::new();
+        registry.register("C:\\Game\\Win64\\ue4ss.dll", "D:\\overlay\\Wrap\\ue4ss.dll");
+
+        let target = NormalizedPath::new("D:\\overlay\\Wrap\\ue4ss.dll");
+        assert_eq!(
+            registry.reverse_lookup(&target),
+            Some(PathBuf::from("C:\\Game\\Win64\\ue4ss.dll"))
+        );
+    }
+
+    #[test]
+    fn test_reverse_lookup_through_structural_mapping() {
+        let mut registry = PathRegistry::new();
+        registry.register("C:\\Game\\Win64\\Mods", "D:\\MyMods");
+
+        let target = NormalizedPath::new("D:\\MyMods\\SomeMod\\main.lua");
+        assert_eq!(
+            registry.reverse_lookup(&target),
+            Some(PathBuf::from("C:\\Game\\Win64\\Mods\\somemod\\main.lua"))
+        );
+    }
+
+    #[test]
+    fn test_reverse_lookup_no_match() {
+        let mut registry = PathRegistry::new();
+        registry.register("C:\\Game\\Mods", "D:\\MyMods");
+
+        let unrelated = NormalizedPath::new("E:\\Other\\file.txt");
+        assert_eq!(registry.reverse_lookup(&unrelated), None);
     }
 
     #[test]
