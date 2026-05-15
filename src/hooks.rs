@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::{alloc, mem, ptr, slice};
-use std::alloc::Layout;
+use std::{ptr, slice};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -238,6 +237,115 @@ pub unsafe extern "system" fn createfilew_detour(
     )
 }
 
+/// Outcome of splicing a remapped path into an `OBJECT_ATTRIBUTES`.
+enum SpliceOutcome {
+    /// Path is masked; caller returns "not found" without forwarding.
+    Masked,
+    /// Forward the call unmodified.
+    Bypass,
+    /// Forward the call; dropping the guard restores `ObjectName` and frees
+    /// the spliced allocation.
+    Forwarded(ObjectAttributesGuard),
+}
+
+/// Restores `ObjectName` and frees the spliced buffer + `UNICODE_STRING` on drop.
+struct ObjectAttributesGuard {
+    object_attrs: *mut OBJECT_ATTRIBUTES,
+    original_name: *mut UNICODE_STRING,
+    _buffer: Vec<u16>,
+    spliced_unicode: *mut UNICODE_STRING,
+}
+
+impl Drop for ObjectAttributesGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.object_attrs).ObjectName = self.original_name;
+            drop(Box::from_raw(self.spliced_unicode));
+        }
+    }
+}
+
+/// Decode the path from `OBJECT_ATTRIBUTES.ObjectName`, run it through the
+/// remap registry, and install a heap-backed spliced `UNICODE_STRING` if a
+/// remap fires. Shared by all NT-layer detours that take an `OBJECT_ATTRIBUTES`.
+unsafe fn splice_object_attributes_path(
+    object_attrs: *mut OBJECT_ATTRIBUTES,
+    log_tag: &str,
+) -> SpliceOutcome {
+    if object_attrs.is_null() {
+        return SpliceOutcome::Bypass;
+    }
+    let original_name = (*object_attrs).ObjectName;
+    if original_name.is_null() {
+        return SpliceOutcome::Bypass;
+    }
+    let unicode_path = *original_name;
+    let path_len = (unicode_path.Length / 2) as usize;
+
+    // Need 4 wchars for the `\??\` prefix; below that `path_len - 4` underflows.
+    if path_len < 4 || unicode_path.Buffer.is_null() {
+        return SpliceOutcome::Bypass;
+    }
+
+    let prefix_slice = slice::from_raw_parts(unicode_path.Buffer, 4);
+    let body_slice = slice::from_raw_parts(unicode_path.Buffer.add(4), path_len - 4);
+
+    let effective_len = body_slice
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(body_slice.len());
+    let body = &body_slice[..effective_len];
+
+    let Ok(path_str) = WideString::from_vec(body.to_vec()).to_string() else {
+        return SpliceOutcome::Bypass;
+    };
+
+    let bad_prefixes = ["\\\\device", "c:\\windows"];
+    let lower = path_str.to_lowercase();
+    if bad_prefixes.iter().any(|p| lower.starts_with(p)) {
+        return SpliceOutcome::Bypass;
+    }
+
+    let original_path = PathBuf::from(&path_str);
+    let normalized = NormalizedPath::new(&original_path);
+
+    if is_masked(&normalized) {
+        debug!("[{}] masked: {:?}", log_tag, original_path);
+        return SpliceOutcome::Masked;
+    }
+
+    let new_path = remap_path(&normalized).unwrap_or_else(|| normalized.to_path_buf());
+    debug!("[{}] {:?} to {:?}", log_tag, original_path, new_path);
+
+    let wide_new_path = paths::path_to_widestring(&new_path);
+
+    // Buffer layout: original prefix + remapped path + null terminator.
+    let mut buffer: Vec<u16> = Vec::with_capacity(prefix_slice.len() + wide_new_path.len() + 1);
+    buffer.extend_from_slice(prefix_slice);
+    buffer.extend_from_slice(wide_new_path.as_slice());
+    buffer.push(0);
+
+    // Length excludes the null terminator; MaximumLength includes it.
+    let used_bytes = ((buffer.len() - 1) * 2) as u16;
+    let max_bytes = (buffer.len() * 2) as u16;
+    let buffer_ptr = buffer.as_mut_ptr();
+
+    let spliced_unicode = Box::into_raw(Box::new(UNICODE_STRING {
+        Length: used_bytes,
+        MaximumLength: max_bytes,
+        Buffer: buffer_ptr,
+    }));
+
+    (*object_attrs).ObjectName = spliced_unicode;
+
+    SpliceOutcome::Forwarded(ObjectAttributesGuard {
+        object_attrs,
+        original_name,
+        _buffer: buffer,
+        spliced_unicode,
+    })
+}
+
 pub unsafe extern "system" fn ntcreatefile_detour(
     file_handle: *mut HANDLE,
     desired_access: u32,
@@ -251,100 +359,12 @@ pub unsafe extern "system" fn ntcreatefile_detour(
     ea_buffer: *mut c_void,
     ea_length: u32,
 ) -> NTSTATUS {
-    // The path is stored a couple layers deep in a UNICODE_STRING struct. Lets grab it.
-    let unicode_path = *(*object_attrs).ObjectName;
-    let path_len = (unicode_path.Length / 2) as usize;
-
-    // Strip the Rtl prefix from the given string. We need to reintroduce this later.
-    let og_prefix = slice::from_raw_parts(unicode_path.Buffer, 4);
-    let offset_path = unicode_path.Buffer.add(4);
-
-    // Create a raw slice and handle potential nulls safely
-    let slice = slice::from_raw_parts(offset_path, path_len - 4);
-
-    // Find the first null terminator, if any
-    let null_pos = slice.iter().position(|&c| c == 0);
-
-    let effective_len = null_pos.unwrap_or(path_len - 4);
-    let effective_slice = &slice[..effective_len];
-
-    // Use from_vec instead of from_slice
-    let wide_string = WideString::from_vec(effective_slice.to_vec());
-    let original_path_result = wide_string.to_string();
-
-    // Early return if we can't process the path
-    if original_path_result.is_err() {
-        return NtCreateFile_Detour.call(
-            file_handle,
-            desired_access,
-            object_attrs,
-            io_status_block,
-            allocation_size,
-            file_attrs,
-            share_access,
-            creation_disposition,
-            create_options,
-            ea_buffer,
-            ea_length
-        );
-    }
-
-    let original_path_str = original_path_result.unwrap();
-
-    let bad_path_prefixes = ["\\\\device", "c:\\windows"];
-    if bad_path_prefixes.iter().any(|x| {
-        let lowercase = original_path_str.to_lowercase();
-        lowercase.starts_with(&x.to_lowercase())
-    }) {
-        return NtCreateFile_Detour.call(
-            file_handle,
-            desired_access,
-            object_attrs,
-            io_status_block,
-            allocation_size,
-            file_attrs,
-            share_access,
-            creation_disposition,
-            create_options,
-            ea_buffer,
-            ea_length
-        );
+    let _guard = match splice_object_attributes_path(object_attrs, "ntcreatefile_detour") {
+        SpliceOutcome::Masked => return STATUS_OBJECT_NAME_NOT_FOUND,
+        SpliceOutcome::Bypass => None,
+        SpliceOutcome::Forwarded(g) => Some(g),
     };
 
-    let original_path = PathBuf::from(original_path_str);
-    let new_path = NormalizedPath::new(&original_path);
-    if is_masked(&new_path) {
-        debug!("[ntcreatefile_detour] masked: {:?}", original_path);
-        return STATUS_OBJECT_NAME_NOT_FOUND;
-    }
-    let new_path = remap_path(&new_path).unwrap_or_else(|| new_path.to_path_buf());
-
-    debug!("[ntcreatefile_detour] {:?} to {:?}", original_path, new_path);
-
-    // Update the Length property in the UNICODE_STRING struct with the new length of the path.
-    // (+ convert the new path back into a raw widestring and copy it into the buffer.)
-    let wide_new_path = paths::path_to_widestring(&new_path);
-    let new_path_size = (wide_new_path.len() * 2) + 8;
-
-    let buffer_layout = Layout::array::<u16>(og_prefix.len() + wide_new_path.len() + 1).unwrap();
-    let buffer = alloc::alloc_zeroed(buffer_layout).cast::<u16>();
-
-    // The length of the buffer in bytes.
-    let used_size = (og_prefix.len() + wide_new_path.len()) * 2;
-    let buffer_size = used_size + 2;
-
-    ptr::copy_nonoverlapping(og_prefix.as_ptr(), buffer, og_prefix.len());
-    ptr::copy_nonoverlapping(wide_new_path.as_ptr(), buffer.add(og_prefix.len()), wide_new_path.len());
-
-    let mut new_unicode = UNICODE_STRING {
-        Length: used_size as _,
-        MaximumLength: buffer_size as _,
-        Buffer: buffer,
-    };
-
-    (*object_attrs).ObjectName = ptr::addr_of_mut!(new_unicode);
-
-    // Call NtCreateFile now, we need to do some forgettin' before we can be done.
     NtCreateFile_Detour.call(
         file_handle,
         desired_access,
@@ -356,7 +376,7 @@ pub unsafe extern "system" fn ntcreatefile_detour(
         creation_disposition,
         create_options,
         ea_buffer,
-        ea_length
+        ea_length,
     )
 }
 
