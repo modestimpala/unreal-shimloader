@@ -279,9 +279,13 @@ pub unsafe extern "system" fn createfilew_detour(
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[createfilew_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[createfilew_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -375,8 +379,13 @@ unsafe fn splice_object_attributes_path(
         return SpliceOutcome::Masked;
     }
 
-    let new_path = remap_path(&normalized).unwrap_or_else(|| normalized.to_path_buf());
-    debug!("[{}] {:?} to {:?}", log_tag, original_path, new_path);
+    let new_path = match remap_path(&normalized) {
+        Some(remapped) => {
+            debug!("[{}] {:?} to {:?}", log_tag, original_path, remapped);
+            remapped
+        }
+        None => normalized.to_path_buf(),
+    };
 
     let wide_new_path = paths::path_to_widestring(&new_path);
 
@@ -513,9 +522,13 @@ unsafe extern "system" fn getfileattributesw_detour(
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[getfileattributesw_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[getfileattributesw_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -541,9 +554,13 @@ unsafe extern "system" fn getfileattributesexw_detour(
         SetLastError(ERROR_FILE_NOT_FOUND);
         return 0;
     }
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[getfileattributesexw_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[getfileattributesexw_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -612,9 +629,13 @@ unsafe extern "system" fn findfirstfilew_detour(
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[findfirstfilew_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[findfirstfilew_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -658,9 +679,13 @@ unsafe extern "system" fn findfirstfileexw_detour(
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[findfirstfileexw_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[findfirstfileexw_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -722,8 +747,13 @@ unsafe extern "system" fn findclose_detour(handle: HANDLE) -> BOOL {
 
 unsafe extern "system" fn loadlibraryw_detour(lpfilename: PCWSTR) -> HMODULE {
     let path = paths::pcwstr_to_path(lpfilename);
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-    debug!("[loadlibraryw_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[loadlibraryw_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -735,8 +765,13 @@ unsafe extern "system" fn loadlibraryw_detour(lpfilename: PCWSTR) -> HMODULE {
 /// Required for experimental UE4SS debug builds. As of ed989df they use LoadLibraryExW to load their DLLs instead of LoadLibraryW
 unsafe extern "system" fn loadlibraryexw_detour(lpfilename: PCWSTR, hfile: HANDLE, dwflags: LOAD_LIBRARY_FLAGS) -> HMODULE {
     let path = paths::pcwstr_to_path(lpfilename);
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-    debug!("[loadlibraryexw_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[loadlibraryexw_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
 
@@ -747,9 +782,13 @@ unsafe extern "system" fn loadlibraryexw_detour(lpfilename: PCWSTR, hfile: HANDL
 
 unsafe extern "system" fn adddlldirectory_detour(lppathnamestr: PCWSTR) -> *mut c_void {
     let path = paths::pcwstr_to_path(lppathnamestr);
-    let new_path = remap_path(&path).unwrap_or_else(|| path.to_path_buf());
-
-    debug!("[adddlldirectory_detour] {:?} to {:?}", path, new_path);
+    let new_path = match remap_path(&path) {
+        Some(remapped) => {
+            debug!("[adddlldirectory_detour] {:?} to {:?}", path, remapped);
+            remapped
+        }
+        None => path.to_path_buf(),
+    };
 
     let wide_path = paths::path_to_widestring(&new_path);
     let raw_path = wide_path.as_ptr();
