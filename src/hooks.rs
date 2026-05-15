@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::{ptr, slice};
+use std::{mem, ptr, slice};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fs::{File, OpenOptions};
@@ -8,8 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use log::{debug, error};
-use once_cell::sync::Lazy;
-use retour::static_detour;
+use once_cell::sync::{Lazy, OnceCell};
+use retour::{static_detour, GenericDetour};
 use widestring::{U16CStr, U16CString, WideString};
 use windows_sys::core::{PCWSTR, PWSTR};
 use windows_sys::w;
@@ -33,7 +33,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FindClose, FindFileHandle, FindFirstFileExW, FindFirstFileW, FindNextFileW, GetFileAttributesExW, GetFileAttributesW, NtCreateFile, FILE_ATTRIBUTE_DIRECTORY, FILE_CREATION_DISPOSITION, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_MODE, FINDEX_INFO_LEVELS, FINDEX_SEARCH_OPS, FIND_FIRST_EX_FLAGS, GET_FILEEX_INFO_LEVELS, NT_CREATE_FILE_DISPOSITION, WIN32_FIND_DATAW
 };
 use windows_sys::Win32::System::Environment::GetCommandLineW;
-use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, LoadLibraryExW, AddDllDirectory, GetModuleFileNameW, LOAD_LIBRARY_FLAGS};
+use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, LoadLibraryExW, AddDllDirectory, GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_FLAGS};
 use windows_sys::Win32::System::WindowsProgramming::{
     IO_STATUS_BLOCK,
     IO_STATUS_BLOCK_0,
@@ -42,6 +42,30 @@ use windows_sys::Win32::System::WindowsProgramming::{
 use crate::paths::{self, NormalizedPath, is_masked, remap_path, reverse_remap};
 
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFF_FFFF;
+
+// Not in windows-sys 0.48. Static link is safe; both are NT4+.
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryAttributesFile(
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        FileInformation: *mut c_void,
+    ) -> NTSTATUS;
+
+    fn NtQueryFullAttributesFile(
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        FileInformation: *mut c_void,
+    ) -> NTSTATUS;
+}
+
+/// Win10 1809+, resolved dynamically. MSVC 17.x routes
+/// `std::filesystem::status` / `exists` through this.
+type NtQueryInformationByNameFn = unsafe extern "system" fn(
+    *mut OBJECT_ATTRIBUTES,
+    *mut IO_STATUS_BLOCK,
+    *mut c_void,
+    u32,
+    u32,
+) -> NTSTATUS;
 
 
 static_detour! {
@@ -67,6 +91,16 @@ static_detour! {
         u32,
         *mut c_void,
         u32
+    ) -> NTSTATUS;
+
+    pub static NtQueryAttributesFile_Detour: unsafe extern "system" fn(
+        *mut OBJECT_ATTRIBUTES,
+        *mut c_void
+    ) -> NTSTATUS;
+
+    pub static NtQueryFullAttributesFile_Detour: unsafe extern "system" fn(
+        *mut OBJECT_ATTRIBUTES,
+        *mut c_void
     ) -> NTSTATUS;
 
     pub static GetFileAttributesW_Detour: unsafe extern "system" fn(PCWSTR) -> u32;
@@ -125,6 +159,10 @@ static SANITIZED_COMMAND_LINE: Lazy<U16CString> = Lazy::new(|| unsafe {
     U16CString::from_vec_truncate(cleaned)
 });
 
+/// Populated only on Win10 1809+, where `GetProcAddress` finds the export.
+static NT_QUERY_INFORMATION_BY_NAME_DETOUR: OnceCell<GenericDetour<NtQueryInformationByNameFn>> =
+    OnceCell::new();
+
 
 pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
     CreateFileW_Detour.initialize(CreateFileW, |a, b, c, d, e, f, g| unsafe {
@@ -154,6 +192,29 @@ pub unsafe fn enable_hooks() -> Result<(), Box<dyn Error>> {
             k,
         )
     })?.enable()?;
+
+    NtQueryAttributesFile_Detour.initialize(NtQueryAttributesFile, |a, b| {
+        ntqueryattributesfile_detour(a, b)
+    })?.enable()?;
+
+    NtQueryFullAttributesFile_Detour.initialize(NtQueryFullAttributesFile, |a, b| {
+        ntqueryfullattributesfile_detour(a, b)
+    })?.enable()?;
+
+    // Win10 1809+. Populate the OnceCell before enable() so a racing caller
+    // can't observe an empty cell from inside the detour body.
+    if let Some(target) =
+        resolve_ntdll_export::<NtQueryInformationByNameFn>(b"NtQueryInformationByName\0")
+    {
+        let detour = GenericDetour::new(target, ntqueryinformationbyname_detour)?;
+        if NT_QUERY_INFORMATION_BY_NAME_DETOUR.set(detour).is_err() {
+            error!("NtQueryInformationByName detour already initialized");
+        } else if let Some(stored) = NT_QUERY_INFORMATION_BY_NAME_DETOUR.get() {
+            stored.enable()?;
+        }
+    } else {
+        debug!("NtQueryInformationByName not exported by ntdll; hook skipped");
+    }
 
     GetFileAttributesW_Detour.initialize(GetFileAttributesW, |a| unsafe {
         getfileattributesw_detour(a)
@@ -378,6 +439,69 @@ pub unsafe extern "system" fn ntcreatefile_detour(
         ea_buffer,
         ea_length,
     )
+}
+
+unsafe extern "system" fn ntqueryattributesfile_detour(
+    object_attrs: *mut OBJECT_ATTRIBUTES,
+    file_information: *mut c_void,
+) -> NTSTATUS {
+    let _guard = match splice_object_attributes_path(object_attrs, "ntqueryattributesfile_detour") {
+        SpliceOutcome::Masked => return STATUS_OBJECT_NAME_NOT_FOUND,
+        SpliceOutcome::Bypass => None,
+        SpliceOutcome::Forwarded(g) => Some(g),
+    };
+
+    NtQueryAttributesFile_Detour.call(object_attrs, file_information)
+}
+
+unsafe extern "system" fn ntqueryfullattributesfile_detour(
+    object_attrs: *mut OBJECT_ATTRIBUTES,
+    file_information: *mut c_void,
+) -> NTSTATUS {
+    let _guard = match splice_object_attributes_path(object_attrs, "ntqueryfullattributesfile_detour") {
+        SpliceOutcome::Masked => return STATUS_OBJECT_NAME_NOT_FOUND,
+        SpliceOutcome::Bypass => None,
+        SpliceOutcome::Forwarded(g) => Some(g),
+    };
+
+    NtQueryFullAttributesFile_Detour.call(object_attrs, file_information)
+}
+
+unsafe extern "system" fn ntqueryinformationbyname_detour(
+    object_attrs: *mut OBJECT_ATTRIBUTES,
+    io_status_block: *mut IO_STATUS_BLOCK,
+    file_information: *mut c_void,
+    length: u32,
+    file_information_class: u32,
+) -> NTSTATUS {
+    let _guard = match splice_object_attributes_path(object_attrs, "ntqueryinformationbyname_detour") {
+        SpliceOutcome::Masked => return STATUS_OBJECT_NAME_NOT_FOUND,
+        SpliceOutcome::Bypass => None,
+        SpliceOutcome::Forwarded(g) => Some(g),
+    };
+
+    // OnceCell is populated before enable(), so .get() is always Some here.
+    NT_QUERY_INFORMATION_BY_NAME_DETOUR
+        .get()
+        .expect("ntqueryinformationbyname detour fired before OnceCell was populated")
+        .call(
+            object_attrs,
+            io_status_block,
+            file_information,
+            length,
+            file_information_class,
+        )
+}
+
+/// Resolve an ntdll export. `name` must be nul-terminated. Returns `None` if
+/// the symbol is absent.
+unsafe fn resolve_ntdll_export<T>(name: &[u8]) -> Option<T> {
+    let ntdll = GetModuleHandleW(w!("ntdll.dll"));
+    if ntdll == 0 {
+        return None;
+    }
+    let addr = GetProcAddress(ntdll, name.as_ptr())?;
+    Some(mem::transmute_copy::<_, T>(&addr))
 }
 
 unsafe extern "system" fn getfileattributesw_detour(
